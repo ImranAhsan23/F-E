@@ -1,73 +1,44 @@
+# metrics.py
 import torch
-from numpy import array, dot
+import torch.nn.functional as F
+from numpy import array
 from numpy.linalg import norm
-def cosine_similarity(a, b):
-    a, b = array(a), array(b)
-    return dot(a, b) / (norm(a) * norm(b) + 1e-8)
-def heatmap_coverage(grad_vector, forget_nodes, top_ratio: float = 0.10):
-    grad = array(grad_vector)
-    k = max(1, int(len(grad) * top_ratio))
-    top_idx = set(grad.argsort()[-k:])
-    forget = {int(n.item()) if isinstance(n, torch.Tensor) else int(n) for n in forget_nodes}
-    if len(forget) == 0:
-        return 0.0
-    covered = sum(1 for i in forget if i in top_idx)
-    return round(covered / len(forget), 4)
-def normalize_rule(rule):
-    return rule.strip().replace(" ", "").lower()
-def evaluate_metrics(
-    chef_pre,
-    chef_post,
-    proxy_pre,
-    proxy_post,
-    ra_pre,
-    ra_post,
-    grad_pre,
-    grad_post,
-    model,
-    data,
-    unlearn_time,
-    forget_nodes,
-):
-    rules_pre = set(normalize_rule(r) for r in chef_pre["rules"])
-    rules_post = set(normalize_rule(r) for r in chef_post["rules"])
-    rules_removed = len(rules_pre - rules_post) 
-    jaccard_similarity = len(rules_pre.intersection(rules_post)) / len(rules_pre.union(rules_post))
-    edges_pre = set(tuple(sorted(e)) for e in proxy_pre["graph"])
-    edges_post = set(tuple(sorted(e)) for e in proxy_post["graph"])
-    try:
-        import networkx as nx
 
-        G_pre = nx.Graph()
-        G_pre.add_edges_from(edges_pre)
-        G_post = nx.Graph()
-        G_post.add_edges_from(edges_post)
-        ged_iter = nx.algorithms.similarity.graph_edit_distance(
-            G_pre, G_post, timeout=5
-        )
-        ged_val = next(ged_iter) 
-        if ged_val is None: 
-            raise ValueError("GED timeout")
-    except Exception as e:
-        print(f"Warning: graph_edit_distance fallback ({e})")
-        ged_val = len(edges_pre.symmetric_difference(edges_post))
-    grad_pre_arr = array(grad_pre)
-    grad_post_arr = array(grad_post)
-    min_len = min(len(grad_pre_arr), len(grad_post_arr))
-    grad_pre_arr = grad_pre_arr[:min_len]
-    grad_post_arr = grad_post_arr[:min_len]
-    hs = round(1 - cosine_similarity(grad_pre_arr, grad_post_arr), 4)
-    esd = round(norm(grad_pre_arr - grad_post_arr), 4)
-    hc_pre = heatmap_coverage(grad_pre, forget_nodes)
-    hc_post = heatmap_coverage(grad_post, forget_nodes)
+def evaluate_metrics(
+    chef_pre, chef_post, proxy_pre, proxy_post,
+    ra_pre, ra_post, grad_pre, grad_post,
+    model, data, unlearn_time, forget_nodes,
+):
+    # Rules (RS)
+    rules_pre = {r.strip().replace(" ","").lower() for r in chef_pre["rules"]}
+    rules_post = {r.strip().replace(" ","").lower() for r in chef_post["rules"]}
+    rules_removed = len(rules_pre - rules_post)
+
+    # GED Δ (edge symmetric difference on proxy graphs)
+    edges_pre = {tuple(sorted(e)) for e in proxy_pre["graph"]}
+    edges_post = {tuple(sorted(e)) for e in proxy_post["graph"]}
+    ged_val = len(edges_pre.symmetric_difference(edges_post))
+
+    # HS = mean absolute per-node change
+    g0 = array(grad_pre); g1 = array(grad_post)
+    m = min(len(g0), len(g1))
+    hs = float(abs(g0[:m] - g1[:m]).mean()) if m > 0 else 0.0
+    hs = round(hs, 4)
+
+    # ESD = mean absolute change on forgotten nodes only
+    forget = [int(n.item()) if hasattr(n, "item") else int(n) for n in forget_nodes]
+    esd_terms = []
+    for v in forget:
+        a_pre = grad_pre[v] if v < len(grad_pre) else 0.0
+        a_post = grad_post[v] if v < len(grad_post) else 0.0
+        esd_terms.append(abs(a_pre - a_post))
+    esd = round(float(sum(esd_terms) / max(len(esd_terms), 1)), 4)
+
     return {
         "RA (Pre)": f"{ra_pre}%",
         "RA (Post)": f"{ra_post}%",
         "RA Δ": f"{round(ra_pre - ra_post, 2)}%",
         "HS": hs,
-        "HC (Pre)": hc_pre,
-        "HC (Post)": hc_post,
-        "HC Δ": round(hc_pre - hc_post, 4),
         "ESD": esd,
         "GED (Pre)": len(edges_pre),
         "GED (Post)": len(edges_post),
@@ -79,17 +50,33 @@ def evaluate_metrics(
         "Model": type(model).__name__,
         "Dataset": "physics",
     }
+
 def calculate_residual_attribution(model, data, nodes):
-    device = data.x.device
-    data.x = data.x.detach().clone()
-    data.x.requires_grad = True
-    model.eval()
-    out = model(data.x, data.edge_index)
-    loss = out.mean()
-    loss.backward()
-    grad = data.x.grad.abs().sum(dim=1).detach().cpu() 
-    total = grad.sum().item()
-    nodes = nodes.cpu()
-    forget_score = grad[nodes].sum().item()
-    ra = round((forget_score / total) * 100, 2)
-    return ra, grad.tolist()
+    """
+    RA uses cross-entropy as in Eq. (1) (p.2).
+    Returns: (RA%, grad_vector)
+    """
+    # fresh, grad-enabled copy of features
+    x_clone = data.x.detach().clone().requires_grad_(True)
+    x_old = data.x
+    data.x = x_clone
+    try:
+        model.eval()
+        out = model(data.x, data.edge_index)  # log-softmax
+        if hasattr(data, "train_mask") and data.train_mask is not None and data.train_mask.any():
+            mask = data.train_mask
+        else:
+            mask = torch.arange(data.num_nodes, device=out.device)
+        loss = F.nll_loss(out[mask], data.y[mask])
+        if data.x.grad is not None:
+            data.x.grad.zero_()
+        loss.backward()
+        grad = data.x.grad.abs().sum(dim=1).detach().cpu()  # [N]
+        total = max(float(grad.sum().item()), 1e-12)
+        idx = nodes.cpu() if hasattr(nodes, "cpu") else nodes
+        forget_score = float(grad[idx].sum().item()) if len(idx) > 0 else 0.0
+        ra = round((forget_score / total) * 100, 2)
+        return ra, grad.tolist()
+    finally:
+        data.x = data.x.detach()
+        data.x.requires_grad_(False)
