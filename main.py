@@ -141,9 +141,6 @@ def run_single(dataset: str, strategy: str, seed: int = 0, backbone: str = "gcn"
 
     return results
 
-# ──────────────────────────────────────────────────────────────
-# Aggregation: mean ± std (full) + paper-only CSV
-# ──────────────────────────────────────────────────────────────
 def _aggregate_and_save(all_records, agg_path="batch_unlearning_results_agg.csv"):
     df = pd.DataFrame(all_records)
     df.to_csv("batch_unlearning_results.csv", index=False, encoding='utf-8-sig')
@@ -183,12 +180,10 @@ def _parse_backbones_env():
 def run_all(repeats=5, backbones=None):
     if backbones is None:
         backbones = ["gcn", "graphsage", "gat"]
-    #datasets = ['cora','citeseer','pubmed','CS','Physics']
-    #datasets = ['cora','citeseer','pubmed']
-    datasets = ['Physics']
-    #datasets = ['cora']
-    #strategies = ['retrain','grapheditor','gnndelete','idea']
-    strategies = ['idea']
+    datasets = ['cora','citeseer','pubmed','CS','Physics']
+    
+    strategies = ['retrain','grapheditor','gnndelete','idea']
+    
     all_records = []
     for backbone in backbones:
         for ds in datasets:
@@ -201,6 +196,6 @@ def run_all(repeats=5, backbones=None):
 
 if __name__ == "__main__":
     repeats = int(os.environ.get("REPEATS", 3))
-    #backbones = _parse_backbones_env()  # default: all three
-    backbones = ["gcn", "gat"]
+    backbones = _parse_backbones_env()  # default
     run_all(repeats=repeats, backbones=backbones)
+
