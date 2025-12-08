@@ -1,7 +1,7 @@
 # Forget & Explain: Transparent Verification of GNN Unlearning
 
 This repository contains the implementation for **explainability‑driven verification of GNN unlearning**.  
-It supports **GCN, GraphSAGE, and GAT** backbones and includes **Membership‑Inference (MI)** checks so reviewers can see how our explainability metrics line up with a standard privacy test.
+It supports **GCN, GraphSAGE, and GAT** backbones and includes **Membership‑Inference (MI)** checks so readers can see how our explainability metrics line up with a standard privacy test.
 
 **Core idea.** We verify forgetting by comparing **pre‑ vs post‑unlearning explanations** (saliency, proxy graph structure, rule consistency). Key metrics:
 
